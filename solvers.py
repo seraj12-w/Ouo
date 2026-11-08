@@ -1,0 +1,474 @@
+"""
+solvers.py - Universal Multi-Shortener Solver Engine.
+Supports:
+  - Fast HTTP redirect shorteners (Bitly, TinyURL, Cuttly, is.gd, etc.) with proxy support
+  - OuO family (ouo.io, ouo.press) with Expired/Dead link detection, realistic human interaction,
+    Viewable Ad Impression beacon execution, and strict anti-hang timeouts.
+  - Generic countdown & button shorteners (Droplink, GPLinks, Shrinkme, Shareus, etc.)
+"""
+
+import time
+import random
+import urllib.request
+from urllib.parse import urlparse
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+KNOWN_OUO_DOMAINS = ["ouo.io", "ouo.press"]
+
+KNOWN_FAST_SHORTENERS = [
+    "bit.ly", "tinyurl.com", "cutt.ly", "is.gd", "v.gd", "t.co", "rb.gy", "shorturl.at"
+]
+
+def simulate_human_behavior(page, duration_s: float = None, is_mobile: bool = None):
+    """
+    Simulates realistic human touch/mouse behavior and scrolling.
+    This triggers ad network Viewability beacons (IntersectionObservers)
+    and ensures Google reCAPTCHA v3 assigns a high human score (>0.8).
+    """
+    try:
+        if is_mobile is None:
+            try:
+                is_mobile = page.evaluate("() => Boolean(navigator.maxTouchPoints && navigator.maxTouchPoints > 0)")
+            except Exception:
+                is_mobile = True
+
+        if duration_s is None:
+            duration_s = random.uniform(0.6, 1.2)
+
+        end_time = time.time() + duration_s
+        while time.time() < end_time:
+            if is_mobile:
+                # 📱 Fast Mobile Touch Behavior (Weighted Actions)
+                action = random.choices(
+                    ["swipe_down", "swipe_up", "read_pause", "tap"],
+                    weights=[50, 15, 30, 5],
+                    k=1
+                )[0]
+
+                if action == "swipe_down":
+                    scroll_px = random.randint(180, 380)
+                    page.evaluate(f"window.scrollBy({{top: {scroll_px}, behavior: 'smooth'}});")
+                    page.wait_for_timeout(random.randint(250, 450))
+
+                elif action == "swipe_up":
+                    scroll_px = random.randint(60, 160)
+                    page.evaluate(f"window.scrollBy({{top: -{scroll_px}, behavior: 'smooth'}});")
+                    page.wait_for_timeout(random.randint(200, 350))
+
+                elif action == "read_pause":
+                    page.wait_for_timeout(random.randint(350, 700))
+
+                elif action == "tap":
+                    try:
+                        x = random.randint(25, 75)
+                        y = random.randint(150, 450)
+                        page.touchscreen.tap(x, y)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(random.randint(150, 300))
+
+            else:
+                # 💻 Desktop Mouse Behavior
+                x = random.randint(180, 650)
+                y = random.randint(150, 500)
+                page.mouse.move(x, y, steps=random.randint(5, 10))
+                page.wait_for_timeout(random.randint(250, 500))
+
+                # Smooth scroll wheel
+                scroll_amount = random.randint(200, 420)
+                page.mouse.wheel(0, scroll_amount)
+                page.wait_for_timeout(random.randint(400, 800))
+
+                # Natural mouse drift
+                page.mouse.move(x + random.randint(-35, 35), y + random.randint(-25, 25), steps=4)
+                page.wait_for_timeout(random.randint(300, 700))
+
+    except Exception:
+        pass
+
+def human_click(page, btn, timeout: int = 3000, is_mobile: bool = None):
+    """
+    Clicks or touch-taps an element with natural movement and realistic delay.
+    Includes a strict timeout fallback so obscured elements or ad overlays
+    cannot stall the process.
+    """
+    try:
+        if is_mobile is None:
+            try:
+                is_mobile = page.evaluate("() => Boolean(navigator.maxTouchPoints && navigator.maxTouchPoints > 0)")
+            except Exception:
+                is_mobile = True
+
+        box = btn.bounding_box()
+        if is_mobile and box:
+            target_x = box["x"] + box["width"] / 2 + random.randint(-4, 4)
+            target_y = box["y"] + box["height"] / 2 + random.randint(-3, 3)
+            page.wait_for_timeout(random.randint(100, 250))
+            try:
+                page.touchscreen.tap(target_x, target_y)
+                return True
+            except Exception:
+                btn.click(delay=random.randint(70, 120), timeout=timeout)
+                return True
+        elif box:
+            target_x = box["x"] + box["width"] / 2 + random.randint(-8, 8)
+            target_y = box["y"] + box["height"] / 2 + random.randint(-4, 4)
+            page.mouse.move(target_x, target_y, steps=random.randint(5, 9))
+            page.wait_for_timeout(random.randint(150, 300))
+            btn.click(delay=random.randint(80, 150), timeout=timeout)
+            return True
+        else:
+            btn.click(delay=random.randint(80, 120), timeout=timeout)
+            return True
+    except Exception:
+        # Fallback to force click if obscured by ad overlay
+        try:
+            btn.click(force=True, timeout=2000)
+            return True
+        except Exception:
+            return False
+
+def dwell_on_destination(page, dwell_seconds: int = 15, is_mobile: bool = True):
+    """
+    Deep reading dwell simulation on the final landing/destination page.
+    Triggers ad network Viewable Impression beacons (IntersectionObservers)
+    and analytics so traffic registers as high-retention genuine views.
+    """
+    if not dwell_seconds or dwell_seconds <= 0:
+        return
+    end_time = time.time() + dwell_seconds
+    while time.time() < end_time:
+        rem = end_time - time.time()
+        simulate_human_behavior(page, duration_s=min(rem, random.uniform(2.5, 4.5)), is_mobile=is_mobile)
+
+def is_ouo_homepage(url: str) -> bool:
+    """
+    Checks if a URL points to the OUO homepage (indicating an expired or deleted link).
+    """
+    if not url or not isinstance(url, str):
+        return False
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    if domain not in KNOWN_OUO_DOMAINS:
+        return False
+    path = parsed.path.strip("/")
+    return not path or path in ["index.html", "index.php", "home"]
+
+def is_shortener(url: str) -> bool:
+    """
+    Checks if a URL belongs to a known shortener domain. Returns False for homepages.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    if is_ouo_homepage(url):
+        return False
+
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    if not domain:
+        return False
+
+    path = parsed.path.strip("/")
+    if not path or path in ["index.html", "index.php"]:
+        return False
+
+    shortener_indicators = [
+        "ouo.io", "ouo.press", "bit.ly", "tinyurl.com", "cutt.ly",
+        "is.gd", "v.gd", "t.co", "rb.gy", "droplink", "gplinks",
+        "shrinkme", "shareus", "linkvertise", "adfly"
+    ]
+    return any(ind in domain for ind in shortener_indicators)
+
+def try_fast_http_resolve(url: str, proxy: dict = None, timeout: int = 5) -> str:
+    """
+    Fast HTTP redirect resolver for simple shorteners (Bitly, TinyURL, etc.).
+    Honors proxy settings to prevent IP leakage.
+    """
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    if any(fs in domain for fs in KNOWN_FAST_SHORTENERS):
+        try:
+            handlers = []
+            if proxy and "server" in proxy:
+                handlers.append(urllib.request.ProxyHandler({
+                    "http": proxy["server"],
+                    "https": proxy["server"]
+                }))
+            opener = urllib.request.build_opener(*handlers)
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"}
+            )
+            with opener.open(req, timeout=timeout) as resp:
+                final = resp.geturl()
+                if final and final != url and not is_shortener(final):
+                    return final
+        except Exception:
+            pass
+    return None
+
+def solve_ouo(page, url: str, timeout_sec: int = 25) -> str:
+    """
+    Specialized solver for ouo.io and ouo.press.
+    Simulates human interactions and viewable ad impressions with strict anti-hang timeouts.
+    """
+    # Configure safety timeouts so stalled proxies terminate quickly
+    try:
+        page.set_default_timeout(10000)
+        page.set_default_navigation_timeout(15000)
+    except Exception:
+        pass
+
+    if "ouo.io/" in url:
+        url = url.replace("ouo.io/", "ouo.press/")
+
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
+    except Exception:
+        pass
+
+    # Human behavior & allow ad networks to load banner impressions
+    simulate_human_behavior(page, duration_s=0.8)
+
+    # Check if already redirected to homepage (expired link)
+    if is_ouo_homepage(page.url):
+        return "[EXPIRED / DELETED LINK]"
+
+    # If already reached destination directly
+    if not is_shortener(page.url) and not is_ouo_homepage(page.url) and "ouo." not in page.url:
+        return page.url
+
+    # Stage 1: Fast human interaction & Advance to Stage 2 (/go/...)
+    if "/go/" not in page.url:
+        for _ in range(16):  # poll every 200ms
+            try:
+                if "/go/" in page.url or is_ouo_homepage(page.url):
+                    break
+                btn = page.query_selector("#btn-main, button:has-text('HUMAN'), button:has-text('Human')")
+                if btn:
+                    cls = btn.get_attribute("class") or ""
+                    if "disabled" not in cls:
+                        human_click(page, btn, timeout=2000)
+                        try:
+                            page.wait_for_url(lambda u: "/go/" in u or is_ouo_homepage(u), timeout=2500)
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                pass
+            try:
+                page.wait_for_timeout(200)
+            except Exception:
+                pass
+
+        # Fallback click or form submit if still on Stage 1
+        if "/go/" not in page.url and not is_ouo_homepage(page.url) and is_shortener(page.url):
+            try:
+                page.evaluate('() => { const f = document.querySelector("form"); if (f) f.submit(); }')
+                try:
+                    page.wait_for_url(lambda u: "/go/" in u or is_ouo_homepage(u), timeout=2500)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    # Check if expired again after stage 1
+    if is_ouo_homepage(page.url):
+        return "[EXPIRED / DELETED LINK]"
+
+    # If reached destination
+    if not is_shortener(page.url) and not is_ouo_homepage(page.url) and "ouo." not in page.url:
+        return page.url
+
+    # Stage 2: Ensure Google reCAPTCHA v3 token (x-token) is populated & countdown finishes
+    if "/go/" in page.url:
+        simulate_human_behavior(page, duration_s=0.8)
+
+        recaptcha_sitekey = "6Lcr1ncUAAAAAH3cghg6cOTPGARa8adOf-y9zv2x"
+        trigger_recaptcha_js = f"""() => {{
+            return new Promise((resolve) => {{
+                const timer = setTimeout(() => resolve(false), 2000);
+                const el = document.getElementById("x-token");
+                if (el && el.value && el.value.length > 50) {{
+                    clearTimeout(timer);
+                    resolve(true);
+                    return;
+                }}
+                if (typeof grecaptcha !== "undefined" && grecaptcha.ready) {{
+                    grecaptcha.ready(function() {{
+                        try {{
+                            grecaptcha.execute("{recaptcha_sitekey}", {{action: "pressgo"}}).then(function(tok) {{
+                                if (el) el.value = tok;
+                                clearTimeout(timer);
+                                resolve(true);
+                            }}).catch(() => {{ clearTimeout(timer); resolve(false); }});
+                        }} catch(e) {{ clearTimeout(timer); resolve(false); }}
+                    }});
+                }} else {{
+                    clearTimeout(timer);
+                    resolve(false);
+                }}
+            }});
+        }}"""
+
+        for _ in range(35):  # poll every 250ms
+            try:
+                if "/go/" not in page.url:
+                    break
+
+                try:
+                    page.evaluate(trigger_recaptcha_js)
+                except Exception:
+                    pass
+
+                xtok_len = page.evaluate("() => document.getElementById('x-token') ? document.getElementById('x-token').value.length : 0")
+                btn = page.query_selector('#btn-main, button:has-text("GET LINK"), a:has-text("GET LINK")')
+                if btn:
+                    cls = btn.get_attribute("class") or ""
+                    txt = (btn.inner_text() or "").strip()
+                    if "disabled" not in cls and "GET LINK" in txt.upper() and (xtok_len > 50 or _ > 12):
+                        human_click(page, btn, timeout=2000)
+                        try:
+                            page.wait_for_url(lambda u: "/go/" not in u and not is_ouo_homepage(u), timeout=3500)
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                pass
+            try:
+                page.wait_for_timeout(250)
+            except Exception:
+                pass
+
+        # Fallback click if still on /go/
+        if "/go/" in page.url:
+            try:
+                btn = page.query_selector('#btn-main, button:has-text("GET LINK"), a:has-text("GET LINK")')
+                if btn:
+                    human_click(page, btn, timeout=3000)
+                    try:
+                        page.wait_for_url(lambda u: "/go/" not in u, timeout=5000)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Final Stage 2 form fallback if still on /go/
+        if "/go/" in page.url:
+            try:
+                page.evaluate('() => { const f = document.querySelector("form"); if (f) f.submit(); }')
+                try:
+                    page.wait_for_url(lambda u: "/go/" not in u, timeout=5000)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    final_url = page.url
+    if is_ouo_homepage(final_url):
+        return "[EXPIRED / DELETED LINK]"
+
+    return final_url
+
+def solve_generic_shortener(page, url: str, timeout_sec: int = 30) -> str:
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=timeout_sec * 1000)
+    except Exception:
+        pass
+
+    simulate_human_behavior(page)
+    try:
+        page.wait_for_timeout(2000)
+    except Exception:
+        pass
+
+    initial_selectors = [
+        "button:has-text('Verify')",
+        "a:has-text('Verify')",
+        "button:has-text('Continue')",
+        "a:has-text('Continue')",
+        "button:has-text('Proceed')",
+        "a:has-text('Proceed')",
+    ]
+
+    for sel in initial_selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click(timeout=3000)
+                page.wait_for_timeout(2500)
+                break
+        except Exception:
+            pass
+
+    final_selectors = [
+        "button:has-text('Get Link')",
+        "a:has-text('Get Link')",
+        "button:has-text('Download Link')",
+        "a:has-text('Download Link')",
+        "a.get-link",
+        "#get-link",
+        "#btn-main"
+    ]
+
+    for _ in range(15):
+        for fsel in final_selectors:
+            try:
+                floc = page.locator(fsel)
+                if floc.count() > 0 and floc.first.is_visible():
+                    cls = floc.first.get_attribute("class") or ""
+                    if "disabled" not in cls:
+                        floc.first.click(timeout=3000)
+                        page.wait_for_timeout(3000)
+
+                        pages = page.context.pages
+                        if len(pages) > 1:
+                            for p in pages:
+                                if p != page and p.url and not is_shortener(p.url) and p.url != "about:blank":
+                                    return p.url
+                        return page.url
+            except Exception:
+                pass
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+    return page.url
+
+def universal_resolve(page, url: str, timeout_sec: int = 25, max_hops: int = 5,
+                      proxy: dict = None, is_mobile: bool = True, dwell_sec: int = 0) -> str:
+    current_url = url
+
+    fast_result = try_fast_http_resolve(current_url, proxy=proxy)
+    if fast_result:
+        return fast_result
+
+    for hop in range(1, max_hops + 1):
+        lower = current_url.lower()
+
+        if any(d in lower for d in KNOWN_OUO_DOMAINS):
+            resolved = solve_ouo(page, current_url, timeout_sec=timeout_sec)
+        else:
+            resolved = solve_generic_shortener(page, current_url, timeout_sec=timeout_sec)
+
+        # Check for expired/dead link
+        if resolved == "[EXPIRED / DELETED LINK]":
+            return resolved
+
+        # Check if resolved to non-shortener destination
+        if resolved and not resolved.startswith("chrome-error://") and resolved != "about:blank" and not is_shortener(resolved):
+            if dwell_sec > 0:
+                dwell_on_destination(page, dwell_seconds=dwell_sec, is_mobile=is_mobile)
+            return resolved
+
+        # Chained shortener hop
+        if resolved and resolved != current_url and is_shortener(resolved):
+            current_url = resolved
+        else:
+            break
+
+    if current_url and not is_shortener(current_url) and dwell_sec > 0:
+        dwell_on_destination(page, dwell_seconds=dwell_sec, is_mobile=is_mobile)
+
+    return current_url

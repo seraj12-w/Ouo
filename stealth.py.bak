@@ -1,0 +1,161 @@
+"""
+stealth.py - Anti-Bot & Cloudflare Stealth Evasion scripts for Playwright in Termux.
+Hides automation flags, mocks window.chrome, navigator.webdriver, hardware, plugins,
+userAgentData, and WebGL signatures to match real desktop Chrome.
+"""
+
+STEALTH_JS = """
+(function() {
+    // 1. Prototype-level webdriver cleanup
+    try {
+        const proto = Object.getPrototypeOf(navigator);
+        if (proto) {
+            delete proto.webdriver;
+            Object.defineProperty(proto, 'webdriver', {
+                get: () => undefined,
+                configurable: true,
+                enumerable: true
+            });
+        }
+        delete navigator.webdriver;
+    } catch (e) {}
+
+    // 2. Mock clean window.chrome object
+    if (!window.chrome) {
+        window.chrome = {
+            app: {
+                isInstalled: false,
+                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+            },
+            loadTimes: function() {},
+            csi: function() {}
+        };
+    }
+
+    // 3. Mock Windows platform and userAgentData to perfectly match Windows Chrome UA
+    try {
+        const proto = Object.getPrototypeOf(navigator);
+        Object.defineProperty(proto, 'platform', { get: () => 'Win32', configurable: true });
+        Object.defineProperty(proto, 'vendor', { get: () => 'Google Inc.', configurable: true });
+        Object.defineProperty(proto, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+        Object.defineProperty(proto, 'hardwareConcurrency', { get: () => 8, configurable: true });
+        Object.defineProperty(proto, 'deviceMemory', { get: () => 8, configurable: true });
+
+        // Mock navigator.userAgentData (Critical for reCAPTCHA v3 and Cloudflare Turnstile)
+        const userAgentDataMock = {
+            brands: [
+                { brand: 'Chromium', version: '128' },
+                { brand: 'Not;A=Brand', version: '24' },
+                { brand: 'Google Chrome', version: '128' }
+            ],
+            mobile: false,
+            platform: 'Windows',
+            getHighEntropyValues: function(hints) {
+                return Promise.resolve({
+                    architecture: 'x86',
+                    bitness: '64',
+                    brands: this.brands,
+                    mobile: false,
+                    model: '',
+                    platform: 'Windows',
+                    platformVersion: '10.0.0',
+                    uaFullVersion: '128.0.0.0'
+                });
+            }
+        };
+        Object.defineProperty(proto, 'userAgentData', { get: () => userAgentDataMock, configurable: true });
+
+        // Plugins matching real Chrome desktop
+        const mockPlugins = [
+            { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }
+        ];
+        const pluginArray = Object.create(PluginArray.prototype);
+        mockPlugins.forEach((pl, i) => {
+            const p = Object.create(Plugin.prototype);
+            Object.defineProperty(p, 'name', { get: () => pl.name });
+            Object.defineProperty(p, 'filename', { get: () => pl.filename });
+            Object.defineProperty(p, 'description', { get: () => pl.description });
+            Object.defineProperty(p, 'length', { get: () => 0 });
+            pluginArray[i] = p;
+            pluginArray[pl.name] = p;
+        });
+        Object.defineProperty(pluginArray, 'length', { get: () => mockPlugins.length });
+        pluginArray.item = function(i) { return this[i] || null; };
+        pluginArray.namedItem = function(n) { return this[n] || null; };
+        pluginArray.refresh = function() {};
+
+        Object.defineProperty(proto, 'plugins', { get: () => pluginArray, configurable: true });
+    } catch (e) {}
+
+    // 4. Mock Screen dimensions and Taskbar
+    try {
+        Object.defineProperty(window.screen, 'availWidth', { get: () => 1920, configurable: true });
+        Object.defineProperty(window.screen, 'availHeight', { get: () => 1040, configurable: true });
+        Object.defineProperty(window.screen, 'width', { get: () => 1920, configurable: true });
+        Object.defineProperty(window.screen, 'height', { get: () => 1080, configurable: true });
+        Object.defineProperty(window.screen, 'colorDepth', { get: () => 24, configurable: true });
+    } catch (e) {}
+
+    // 5. Ensure document is focused and visible for Ad Viewability checks
+    try {
+        Object.defineProperty(document, 'hasFocus', { value: () => true, configurable: true });
+        Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+        Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+    } catch (e) {}
+
+    // 6. Mock WebGL Vendor & Renderer (Intel UHD 620 Windows Direct3D11)
+    try {
+        const getParam1 = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(param) {
+            if (param === 37445) return 'Intel Inc.';
+            if (param === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParam1.apply(this, arguments);
+        };
+
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+            const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter = function(param) {
+                if (param === 37445) return 'Intel Inc.';
+                if (param === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return getParam2.apply(this, arguments);
+            };
+        }
+    } catch (e) {}
+
+    // 7. Mock Notification permissions safely without illegal invocation
+    if (window.navigator.permissions && window.navigator.permissions.query) {
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = function(parameters) {
+            return parameters && parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission || 'default' }) :
+                originalQuery.apply(this, arguments);
+        };
+    }
+})();
+"""
+
+STEALTH_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-setuid-sandbox",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+]
+
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+DEFAULT_VIEWPORT = {
+    "width": 1366,
+    "height": 768
+}
+
+def apply_stealth(context):
+    """
+    Applies enhanced stealth scripts to a Playwright browser context.
+    """
+    context.add_init_script(STEALTH_JS)

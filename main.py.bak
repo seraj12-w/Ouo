@@ -1,0 +1,574 @@
+#!/data/data/com.termux/files/usr/bin/env python3
+"""
+link - Fast, fully background Playwright tool to resolve, bypass, and extract links.
+Features:
+  1. ⚡ Stealth Evasion (Cloudflare Anti-Bot & Fingerprint spoofing)
+  2. 🌐 Universal Multi-Shortener Support (OuO, GPLinks, Droplink, TinyURL, Bitly, etc.)
+  3. 🚀 Multi-Threading (Parallel link processing with -c / --concurrency)
+  4. ⚠️ Expired & Dead Link Auto-Detection
+  5. 📊 End-of-Job Clean Summary Report
+  6. 🛡️ Public Proxy Scraping, Rotation & Auto-Failover
+"""
+
+import sys
+import os
+import time
+import argparse
+import itertools
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+
+from stealth import apply_stealth, STEALTH_CHROMIUM_ARGS, DEFAULT_USER_AGENT, DEFAULT_VIEWPORT
+from solvers import universal_resolve, is_shortener
+try:
+    from proxy_manager import scrape_and_validate_proxies, fetch_all_raw_proxies, DynamicProxyPool
+except ImportError:
+    scrape_and_validate_proxies = None
+    fetch_all_raw_proxies = None
+    DynamicProxyPool = None
+
+print_lock = threading.Lock()
+proxy_lock = threading.Lock()
+
+def safe_print(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
+
+def normalize_url(url: str) -> str:
+    url = url.strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = f"https://{url}"
+    if "ouo.io/" in url:
+        url = url.replace("ouo.io/", "ouo.press/")
+    return url
+
+def parse_proxy(raw: str):
+    raw = raw.strip()
+    if not raw or raw.startswith("#"):
+        return None
+
+    # Handle ip:port:user:pass
+    parts = raw.split(":")
+    if len(parts) == 4 and not raw.startswith("http") and not raw.startswith("socks"):
+        ip, port, user, pwd = parts
+        return {
+            "server": f"http://{ip}:{port}",
+            "username": user,
+            "password": pwd,
+            "display": f"http://{user}:***@{ip}:{port}"
+        }
+
+    # Warn on SOCKS4 (unsupported by Chromium/Playwright)
+    if raw.startswith("socks4://"):
+        safe_print(f"⚠️ SOCKS4 is not supported by Chromium/Playwright, skipping: {raw}")
+        return None
+
+    if not (raw.startswith("http://") or raw.startswith("https://") or raw.startswith("socks5://")):
+        raw = f"http://{raw}"
+
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "http").lower()
+    hostname = parsed.hostname
+    if not hostname:
+        return None
+
+    port = parsed.port
+    if not port:
+        port = 1080 if scheme == "socks5" else (443 if scheme == "https" else 80)
+
+    d = {
+        "server": f"{scheme}://{hostname}:{port}",
+    }
+    if parsed.username:
+        d["username"] = parsed.username
+    if parsed.password:
+        d["password"] = parsed.password
+
+    display = f"{scheme}://"
+    if parsed.username:
+        display += f"{parsed.username}:***@"
+    display += f"{hostname}:{port}"
+    d["display"] = display
+
+    return d
+
+def load_proxies(proxy_arg=None, proxy_file="proxies.txt", use_public=False, public_limit=5):
+    proxies = []
+
+    if proxy_arg:
+        p = parse_proxy(proxy_arg)
+        if p:
+            return [p]
+
+    if use_public:
+        if scrape_and_validate_proxies:
+            live_proxies = scrape_and_validate_proxies(limit=public_limit)
+            for lp in live_proxies:
+                p = parse_proxy(lp)
+                if p:
+                    proxies.append(p)
+            return proxies
+        else:
+            safe_print("⚠️ proxy_manager module not found, skipping public proxy scraping.")
+
+    target_path = proxy_file
+    if not os.path.isfile(target_path):
+        fallback = os.path.join(SCRIPT_DIR, "proxies.txt")
+        if os.path.isfile(fallback):
+            target_path = fallback
+
+    if os.path.isfile(target_path):
+        with open(target_path, "r", encoding="utf-8") as f:
+            for line in f:
+                p = parse_proxy(line)
+                if p:
+                    proxies.append(p)
+
+    return proxies
+
+def resolve_single_link(browser, item, proxy_pool=None, current_proxy=None, timeout_sec=30):
+    idx, total, raw_url = item
+    url = normalize_url(raw_url)
+    safe_print(f"[{idx}/{total}] 🔍 Resolving: {url}")
+
+    max_attempts = 3 if proxy_pool else 1
+    final_destination = None
+    working_proxy = None
+
+    def handle_popup(popup):
+        try:
+            popup.wait_for_load_state("domcontentloaded", timeout=3000)
+            u = (popup.url or "").lower()
+            ad_indicators = ["adsterra", "adskeeper", "gatsmamilla", "bet", "casino", "pop", "click"]
+            if any(a in u for a in ad_indicators):
+                popup.close()
+        except Exception:
+            try:
+                popup.close()
+            except Exception:
+                pass
+
+    def run_direct_fallback():
+        safe_print(f"[{idx}/{total}] 🌐 Fallback: Trying direct connection...")
+        d_ctx = None
+        try:
+            d_ctx = browser.new_context(
+                user_agent=DEFAULT_USER_AGENT,
+                viewport=DEFAULT_VIEWPORT,
+                ignore_https_errors=True
+            )
+            apply_stealth(d_ctx)
+            d_page = d_ctx.new_page()
+            d_page.on("popup", handle_popup)
+            return universal_resolve(d_page, url, timeout_sec=timeout_sec)
+        except Exception as e:
+            safe_print(f"[{idx}/{total}] ❌ Direct fallback failed: {e}")
+            return None
+        finally:
+            if d_ctx:
+                try:
+                    d_ctx.close()
+                except Exception:
+                    pass
+
+    for attempt in range(1, max_attempts + 1):
+        context = None
+        proxy_to_use = None
+        try:
+            context_opts = {
+                "user_agent": DEFAULT_USER_AGENT,
+                "viewport": DEFAULT_VIEWPORT,
+                "ignore_https_errors": True
+            }
+
+            if proxy_pool:
+                # Rotate to a fresh unique proxy for every link to guarantee distinct IP per impression
+                if hasattr(proxy_pool, "get_proxy"):
+                    proxy_to_use = proxy_pool.get_proxy()
+                else:
+                    with proxy_lock:
+                        proxy_to_use = next(proxy_pool)
+
+                if proxy_to_use:
+                    safe_print(f"[{idx}/{total}] 🛡️  Proxy: {proxy_to_use['display']}")
+                    context_opts["proxy"] = {
+                        "server": proxy_to_use["server"]
+                    }
+                    if "username" in proxy_to_use:
+                        context_opts["proxy"]["username"] = proxy_to_use["username"]
+                    if "password" in proxy_to_use:
+                        context_opts["proxy"]["password"] = proxy_to_use["password"]
+
+            context = browser.new_context(**context_opts)
+            apply_stealth(context)
+
+            page = context.new_page()
+            page.on("popup", handle_popup)
+
+            res = universal_resolve(page, url, timeout_sec=timeout_sec, proxy=proxy_to_use)
+
+            if res and not is_shortener(res):
+                final_destination = res
+                working_proxy = proxy_to_use
+                if proxy_pool and hasattr(proxy_pool, "report_success") and proxy_to_use:
+                    proxy_pool.report_success(proxy_to_use)
+                break
+            else:
+                if proxy_pool and hasattr(proxy_pool, "report_failure") and proxy_to_use:
+                    proxy_pool.report_failure(proxy_to_use, "Shortener incomplete")
+                current_proxy = None  # Discard sticky proxy on failure
+                if attempt < max_attempts:
+                    safe_print(f"[{idx}/{total}] ⚠️ Proxy failed. Switching to next proxy from pool...")
+                elif proxy_pool:
+                    final_destination = run_direct_fallback()
+                    if final_destination and not is_shortener(final_destination):
+                        break
+
+        except Exception as err:
+            if proxy_pool and hasattr(proxy_pool, "report_failure") and proxy_to_use:
+                proxy_pool.report_failure(proxy_to_use, str(err))
+            current_proxy = None  # Discard sticky proxy on failure
+            if attempt < max_attempts:
+                safe_print(f"[{idx}/{total}] ⚠️ Error with proxy ({err}). Switching to next proxy from pool...")
+            elif proxy_pool:
+                final_destination = run_direct_fallback()
+                if final_destination and not is_shortener(final_destination):
+                    break
+            else:
+                safe_print(f"[{idx}/{total}] ❌ Failed: {err}")
+        finally:
+            if context:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+    status = "FAILED"
+    if final_destination == "[EXPIRED / DELETED LINK]":
+        status = "EXPIRED"
+        safe_print(f"[{idx}/{total}] ⚠️ Status: EXPIRED / DELETED (No longer active on OUO)\n")
+    elif final_destination and not is_shortener(final_destination):
+        status = "SUCCESS"
+        safe_print(f"[{idx}/{total}] 👉 Final Destination: {final_destination}\n")
+    else:
+        status = "FAILED"
+        safe_print(f"[{idx}/{total}] ❌ Could not resolve destination.\n")
+
+    return {
+        "index": idx,
+        "input_url": raw_url,
+        "destination": final_destination,
+        "status": status
+    }, working_proxy
+
+def worker_batch_task(batch_items, proxy_pool, timeout_sec):
+    """
+    Worker task that launches Chromium once and processes all items in its batch.
+    Rotates to a fresh unique proxy for each link to maximize registered impressions.
+    """
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=STEALTH_CHROMIUM_ARGS
+        )
+        try:
+            for item in batch_items:
+                r, _ = resolve_single_link(
+                    browser, item, proxy_pool=proxy_pool,
+                    current_proxy=None, timeout_sec=timeout_sec
+                )
+                results.append(r)
+        finally:
+            browser.close()
+    return results
+
+def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file=None,
+                  clean_input_file=None, loop=False, rounds=1, delay_sec=5, min_proxies=5):
+    total = len(urls)
+    concurrency = max(1, min(concurrency, 4))
+
+    proxy_pool = None
+    if proxies and DynamicProxyPool:
+        raw_file = os.path.join(SCRIPT_DIR, "proxies_raw.txt")
+        active_file = os.path.join(SCRIPT_DIR, "proxies.txt")
+        proxy_pool = DynamicProxyPool(
+            initial_proxies=proxies,
+            min_threshold=max(min_proxies, 30),
+            target_size=max(200, len(proxies)),
+            raw_file=raw_file,
+            active_file=active_file
+        )
+    elif proxies:
+        proxy_pool = itertools.cycle(proxies)
+
+    proxy_count = proxy_pool.size() if hasattr(proxy_pool, "size") else (len(proxies) if proxies else 0)
+
+    print(f"\n🚀 Autonomous Link Resolver Engine Started:")
+    print(f"   📊 Total Links:        {total}")
+    print(f"   ⚡ Concurrency:        {concurrency} parallel worker(s)")
+    print(f"   🛡️  Stealth Mode:       ACTIVE (Anti-Detection & Automation Hidden)")
+    if proxy_count > 0:
+        print(f"   🌐 Dynamic Proxy Pool: {proxy_count} active (Auto-Health & Auto-Refill: ACTIVE)")
+    else:
+        print("   🌐 Proxy Mode:         Direct Connection (No proxy)")
+    if loop:
+        print(f"   🔄 Mode:               INFINITE LOOP (Continuous automated cycle)")
+    elif rounds > 1:
+        print(f"   🔄 Mode:               {rounds} Multi-Proxy Rounds")
+    else:
+        print("   🔄 Mode:               Single Batch Run")
+    if loop or rounds > 1:
+        print(f"   ⏱️ Round Interval:     {delay_sec}s delay between rounds")
+    print("-" * 60)
+
+    total_sessions_processed = 0
+    total_sessions_success = 0
+    round_idx = 0
+    global_start_time = time.time()
+
+    try:
+        while True:
+            round_idx += 1
+            curr_pool_size = proxy_pool.size() if hasattr(proxy_pool, 'size') else (proxy_count if proxy_count > 0 else 'N/A')
+
+            if loop:
+                print(f"\n{'='*60}\n🔄 ROUND {round_idx} (Infinite Loop Mode | Active Proxies in Pool: {curr_pool_size})\n{'='*60}")
+            elif rounds > 1:
+                print(f"\n{'='*60}\n🔄 ROUND {round_idx} of {rounds} (Active Proxies in Pool: {curr_pool_size})\n{'='*60}")
+
+            items = [(i, total, u) for i, u in enumerate(urls, 1)]
+            results = []
+
+            round_start = time.time()
+            if concurrency == 1 or total == 1:
+                results = worker_batch_task(items, proxy_pool, timeout_sec)
+            else:
+                actual_workers = min(concurrency, total)
+                batches = [[] for _ in range(actual_workers)]
+                for i, item in enumerate(items):
+                    batches[i % actual_workers].append(item)
+
+                with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                    futures = [executor.submit(worker_batch_task, b, proxy_pool, timeout_sec) for b in batches if b]
+                    for f in as_completed(futures):
+                        try:
+                            batch_res = f.result()
+                            results.extend(batch_res)
+                        except Exception as e:
+                            safe_print(f"⚠️ Worker batch error: {e}")
+
+            results.sort(key=lambda x: x["index"])
+            round_elapsed = round(time.time() - round_start, 1)
+
+            success_count = sum(1 for r in results if r["status"] == "SUCCESS")
+            expired_count = sum(1 for r in results if r["status"] == "EXPIRED")
+            failed_count = sum(1 for r in results if r["status"] == "FAILED")
+
+            total_sessions_processed += total
+            total_sessions_success += success_count
+
+            print("-" * 60)
+            print(f"📊 ROUND {round_idx} COMPLETE ({round_elapsed}s) | Success: {success_count}/{total} | Active Proxies: {proxy_pool.size() if hasattr(proxy_pool, 'size') else 'N/A'}")
+            print("-" * 60)
+
+            # Save / append to output_file if requested
+            if output_file:
+                try:
+                    with open(output_file, "a", encoding="utf-8") as out_f:
+                        for r in results:
+                            if r["status"] == "SUCCESS" and r["destination"]:
+                                out_f.write(f"[Round {round_idx}] {r['input_url']} -> {r['destination']}\n")
+                    print(f"💾 Logged destinations to: {output_file}")
+                except Exception as e:
+                    print(f"⚠️ Could not write to output file: {e}")
+
+            # Prune confirmed dead links from input file if --clean requested on first round
+            if round_idx == 1 and clean_input_file and os.path.isfile(clean_input_file):
+                expired_urls = set(r["input_url"] for r in results if r["status"] == "EXPIRED")
+                if expired_urls:
+                    working_urls = [u for u in urls if u not in expired_urls]
+                    if working_urls:
+                        try:
+                            with open(clean_input_file, "w", encoding="utf-8") as in_f:
+                                for u in working_urls:
+                                    in_f.write(f"{u}\n")
+                            print(f"🧹 Pruned {len(expired_urls)} confirmed expired link(s) from '{clean_input_file}'. Kept {len(working_urls)} link(s).\n")
+                            urls = working_urls
+                            total = len(urls)
+                        except Exception as e:
+                            print(f"⚠️ Could not write to input file: {e}")
+                    else:
+                        print("⚠️ All links were expired. Skipping pruning to protect input file.\n")
+                else:
+                    print("🧹 Prune check: No expired/dead links found to remove.\n")
+
+            if not loop and round_idx >= rounds:
+                break
+
+            print(f"⏳ Waiting {delay_sec}s before starting next round... (Press Ctrl+C to stop)")
+            time.sleep(delay_sec)
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 Automated Looper stopped by user.")
+
+    total_elapsed = round(time.time() - global_start_time, 1)
+    print("\n" + "=" * 60)
+    print("📊 OVERALL AUTOMATION SESSION SUMMARY")
+    print("=" * 60)
+    print(f"  🔄 Rounds Executed:         {round_idx}")
+    print(f"  🔢 Total Visits Attempted:  {total_sessions_processed}")
+    print(f"  ✅ Successful Resolves:     {total_sessions_success}")
+    if proxy_pool and hasattr(proxy_pool, "size"):
+        print(f"  🛡️ Healthy Proxies in Pool: {proxy_pool.size()}")
+    print(f"  ⏱️ Total Session Time:      {total_elapsed}s")
+    print("=" * 60 + "\n")
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="link",
+        description="🌐 Universal Stealth Link Resolver & Multi-Shortener Bypasser in Termux.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Usage Examples:
+  link                          # Single run on links.txt
+  link -c 3                     # Parallel processing (3 links / 3 proxies simultaneously)
+  link --loop -c 3              # 🔄 Automated INFINITE loop across all valid proxies
+  link --rounds 10 -c 3         # 🔄 Run 10 consecutive rounds across proxies
+  link --loop -c 2 --delay 10   # Infinite loop with 10s natural delay between cycles
+  link -c 2 -o resolved.txt     # Log destinations to resolved.txt
+  link --clean                  # Auto-prune dead/expired links from links.txt
+  link --fetch-proxies          # Harvest 10,000+ proxies from hide.mn & global feeds
+  link -P                       # Auto-scrape live proxies + stealth resolution
+        """
+    )
+    parser.add_argument("target", nargs="?", default=None,
+                        help="URL or text file with links (default: links.txt if present)")
+    parser.add_argument("-f", "--file", metavar="FILE", default=None,
+                        help="Input file containing links (one per line)")
+    parser.add_argument("-c", "--concurrency", type=int, default=2,
+                        metavar="N", help="Number of concurrent parallel threads (default: 2, max: 4)")
+    parser.add_argument("--loop", action="store_true",
+                        help="Run indefinitely in an automated infinite loop across proxies (default behavior)")
+    parser.add_argument("--once", action="store_true",
+                        help="Run only 1 single round and exit")
+    parser.add_argument("--rounds", type=int, default=None,
+                        metavar="NUM", help="Number of proxy rotation rounds to run (default: continuous loop)")
+    parser.add_argument("--delay", type=int, default=5,
+                        metavar="SEC", help="Delay in seconds between consecutive rounds (default: 5)")
+    parser.add_argument("--min-proxies", type=int, default=8,
+                        metavar="NUM", help="Minimum healthy proxies before auto-refill triggers (default: 8)")
+    parser.add_argument("-o", "--output", metavar="FILE", default="impressions.txt",
+                        help="Save resolved final destinations to an output file (default: impressions.txt)")
+    parser.add_argument("--clean", action="store_true",
+                        help="Auto-prune dead/expired links from input links file")
+    parser.add_argument("--fetch-proxies", action="store_true",
+                        help="Harvest thousands of fresh proxies from hide.mn & live feeds into proxies_raw.txt")
+    parser.add_argument("-P", "--public-proxies", action="store_true",
+                        help="Auto-scrape live public proxies and validate them before running")
+    parser.add_argument("--save-proxies", action="store_true",
+                        help="Save validated live proxies to proxies.txt")
+    parser.add_argument("--proxy-limit", type=int, default=10,
+                        metavar="NUM", help="Number of valid public proxies to find (default: 10)")
+    parser.add_argument("-p", "--proxy", metavar="PROXY", default=None,
+                        help="Single proxy URL (e.g., http://user:pass@ip:port or socks5://ip:port)")
+    parser.add_argument("--proxy-file", metavar="FILE", default="proxies.txt",
+                        help="Custom proxies file path (default: proxies.txt)")
+    parser.add_argument("--timeout", type=int, default=30,
+                        metavar="SEC", help="Page timeout in seconds (default: 30)")
+
+    args = parser.parse_args()
+
+    if args.fetch_proxies:
+        if fetch_all_raw_proxies:
+            target = args.proxy_file
+            if target == "proxies.txt":
+                # Save raw proxies to proxies_raw.txt so proxies.txt is not overwritten with unverified proxies
+                target = os.path.join(SCRIPT_DIR, "proxies_raw.txt")
+            all_p = fetch_all_raw_proxies()
+            with open(target, "w", encoding="utf-8") as pf:
+                for pr in all_p:
+                    pf.write(f"{pr}\n")
+            print(f"💾 Successfully harvested and saved {len(all_p)} proxies into: {target}\n")
+            sys.exit(0)
+        else:
+            print("❌ proxy_manager module not found.")
+            sys.exit(1)
+
+    input_file = None
+    urls = []
+
+    if args.file:
+        input_file = args.file
+    elif args.target and (args.target.endswith(".txt") or os.path.isfile(args.target)):
+        input_file = args.target
+    elif args.target:
+        urls = [args.target]
+    else:
+        if os.path.isfile("links.txt"):
+            input_file = "links.txt"
+        elif os.path.isfile(os.path.join(SCRIPT_DIR, "links.txt")):
+            input_file = os.path.join(SCRIPT_DIR, "links.txt")
+        else:
+            parser.print_help()
+            print("\n❌ Error: No URL provided and 'links.txt' not found.")
+            sys.exit(1)
+
+    if input_file:
+        if not os.path.isfile(input_file):
+            print(f"❌ Error: File '{input_file}' not found.")
+            sys.exit(1)
+        with open(input_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls.append(line)
+
+    if not urls:
+        print(f"⚠️ No valid links found to process in '{input_file}'.")
+        sys.exit(0)
+
+    proxies = load_proxies(
+        proxy_arg=args.proxy,
+        proxy_file=args.proxy_file,
+        use_public=args.public_proxies or args.save_proxies,
+        public_limit=args.proxy_limit
+    )
+
+    if args.save_proxies and proxies:
+        save_path = os.path.join(SCRIPT_DIR, "proxies.txt")
+        with open(save_path, "w", encoding="utf-8") as pf:
+            for pr in proxies:
+                pf.write(f"{pr['server']}\n")
+        print(f"💾 Saved {len(proxies)} validated proxies to: {save_path}\n")
+
+    if args.once:
+        is_loop = False
+        rounds_count = 1
+    elif args.rounds:
+        is_loop = False
+        rounds_count = args.rounds
+    else:
+        is_loop = True
+        rounds_count = 1
+
+    process_links(
+        urls,
+        proxies=proxies,
+        concurrency=args.concurrency,
+        timeout_sec=args.timeout,
+        output_file=args.output,
+        clean_input_file=input_file if args.clean else None,
+        loop=is_loop,
+        rounds=rounds_count,
+        delay_sec=args.delay,
+        min_proxies=args.min_proxies
+    )
+
+if __name__ == "__main__":
+    main()

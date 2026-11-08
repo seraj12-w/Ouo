@@ -1,0 +1,6 @@
+# Python dependencies for Link Tool
+playwright>=1.40.0
+
+# Termux installation note:
+# In Termux (Android), playwright and chromium are installed via:
+# pkg install python-playwright chromium
